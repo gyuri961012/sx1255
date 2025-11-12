@@ -6,11 +6,18 @@
 #include <SoapySDR/Time.hpp>
 
 #include <string.h>
+#include <string>
 #include <cassert>
 #include <chrono>
 #include <fstream>
+#include <cmath>
 #include <thread>
 #include <mutex>
+#include <utility>
+#include <memory>
+#include <stdexcept>
+#include <system_error>
+#include <cerrno>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -20,7 +27,7 @@
 
 #include <alsa/asoundlib.h>
 #include <alsa/control.h>
-#include <gpiod.hpp>
+#include <gpiod.h>
 
 // Streaming mode, affecting how starting, stopping, overruns and underruns
 // are handled.
@@ -403,8 +410,92 @@ private:
     mutable std::recursive_mutex reg_mutex;
 
     Spi spi;
-    gpiod::chip gpio;
-    gpiod::line gpio_reset, gpio_rx, gpio_tx;
+
+    class GpiodLine
+    {
+    public:
+        GpiodLine() = default;
+        GpiodLine(const GpiodLine &) = delete;
+        GpiodLine &operator=(const GpiodLine &) = delete;
+        GpiodLine(GpiodLine &&other) noexcept : line(other.line)
+        {
+            other.line = nullptr;
+        }
+
+        GpiodLine &operator=(GpiodLine &&other) noexcept
+        {
+            if (this != &other)
+            {
+                release();
+                line = other.line;
+                other.line = nullptr;
+            }
+            return *this;
+        }
+
+        ~GpiodLine()
+        {
+            release();
+        }
+
+        void init(gpiod_chip *chip, unsigned int offset, const char *consumer, int flags, int default_value)
+        {
+            release();
+            line = gpiod_chip_get_line(chip, offset);
+            if (!line)
+            {
+                int err = errno;
+                throw std::system_error(err, std::generic_category(), "Failed to get GPIO line");
+            }
+
+            int ret;
+            if (flags != 0)
+                ret = gpiod_line_request_output_flags(line, consumer, flags, default_value);
+            else
+                ret = gpiod_line_request_output(line, consumer, default_value);
+
+            if (ret < 0)
+            {
+                int err = errno;
+                line = nullptr;
+                throw std::system_error(err, std::generic_category(), "Failed to request GPIO line");
+            }
+        }
+
+        void release()
+        {
+            if (line != nullptr)
+            {
+                gpiod_line_release(line);
+                line = nullptr;
+            }
+        }
+
+        void set_value(int value)
+        {
+            if (line == nullptr)
+                throw std::runtime_error("GPIO line not initialized");
+
+            if (gpiod_line_set_value(line, value) < 0)
+                throw std::system_error(errno, std::generic_category(), "Failed to set GPIO line value");
+        }
+
+    private:
+        gpiod_line *line = nullptr;
+    };
+
+    using GpiodChipPtr = std::unique_ptr<gpiod_chip, decltype(&gpiod_chip_close)>;
+
+    static GpiodChipPtr open_gpio_chip(const char *name)
+    {
+        gpiod_chip *chip = gpiod_chip_open_by_name(name);
+        if (chip == nullptr)
+            throw std::system_error(errno, std::generic_category(), "Failed to open GPIO chip");
+        return GpiodChipPtr(chip, &gpiod_chip_close);
+    }
+
+    GpiodChipPtr gpio;
+    GpiodLine gpio_reset, gpio_rx, gpio_tx;
     AlsaPcm alsa_rx;
     AlsaPcm alsa_tx;
 
@@ -469,24 +560,12 @@ private:
         spi.transfer(buf, buf);
     }
 
-    void init_gpio(void)
+    void init_gpio(unsigned int reset_offset, unsigned int rx_offset, unsigned int tx_offset)
     {
         SoapySDR_logf(SOAPY_SDR_DEBUG, "Requesting GPIO lines");
-        gpio_reset.request({
-            .consumer = "SX reset",
-            .request_type = gpiod::line_request::DIRECTION_OUTPUT,
-            .flags = gpiod::line_request::FLAG_OPEN_SOURCE
-        }, 0);
-        gpio_rx.request({
-            .consumer = "SX RX",
-            .request_type = gpiod::line_request::DIRECTION_OUTPUT,
-            .flags = 0
-        }, 1);
-        gpio_tx.request({
-            .consumer = "SX TX",
-            .request_type = gpiod::line_request::DIRECTION_OUTPUT,
-            .flags = 0
-        }, 1);
+        gpio_reset.init(gpio.get(), reset_offset, "SX reset", GPIOD_LINE_REQUEST_FLAG_OPEN_SOURCE, 0);
+        gpio_rx.init(gpio.get(), rx_offset, "SX RX", 0, 1);
+        gpio_tx.init(gpio.get(), tx_offset, "SX TX", 0, 1);
     }
 
     void reset_chip(void)
@@ -555,10 +634,7 @@ public:
         sampleRate(125.0e3),
         // TODO: support custom SPIDEV path as an argument
         spi("/dev/spidev0.0"),
-        gpio("gpiochip0"),
-        gpio_reset(gpio.get_line(5)),
-        gpio_rx(gpio.get_line(hwversion == 0x0100 ? 13 : 23)),
-        gpio_tx(gpio.get_line(hwversion == 0x0100 ? 12 : 22)),
+        gpio(open_gpio_chip("gpiochip0")),
         alsa_rx(AlsaPcm("hw:CARD=SX1255,DEV=1", SND_PCM_STREAM_CAPTURE)),
         alsa_tx(AlsaPcm("hw:CARD=SX1255,DEV=0", SND_PCM_STREAM_PLAYBACK)),
         tx_threshold2(0.0f),
@@ -569,7 +645,11 @@ public:
 
         SoapySDR_logf(SOAPY_SDR_INFO, "Initializing SoapySX");
 
-        init_gpio();
+        const unsigned int reset_offset = 5;
+        const unsigned int rx_offset = (hwversion == 0x0100 ? 13U : 23U);
+        const unsigned int tx_offset = (hwversion == 0x0100 ? 12U : 22U);
+
+        init_gpio(reset_offset, rx_offset, tx_offset);
         reset_chip();
         init_chip();
         detect_clock();
@@ -589,6 +669,10 @@ public:
 
         // Make sure PA is turned off
         writeSetting("PA", "OFF");
+
+        gpio_tx.release();
+        gpio_rx.release();
+        gpio_reset.release();
     }
 
 /***********************************************************************
