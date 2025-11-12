@@ -448,11 +448,13 @@ private:
                 throw std::system_error(err, std::generic_category(), "Failed to get GPIO line");
             }
 
-            int ret;
-            if (flags != 0)
-                ret = gpiod_line_request_output_flags(line, consumer, flags, default_value);
-            else
-                ret = gpiod_line_request_output(line, consumer, default_value);
+            gpiod_line_request_config config;
+            memset(&config, 0, sizeof(config));
+            config.consumer = consumer;
+            config.request_type = GPIOD_LINE_REQUEST_DIRECTION_OUTPUT;
+            config.flags = flags;
+
+            int ret = gpiod_line_request(line, &config, default_value);
 
             if (ret < 0)
             {
