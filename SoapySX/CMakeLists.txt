@@ -18,7 +18,7 @@ set(CMAKE_BUILD_TYPE ${CMAKE_BUILD_TYPE} CACHE STRING "")
 # These may be found within the build tree or in an external project.
 ########################################################################
 set(MY_DEVICE_INCLUDE_DIRS "")
-set(MY_DEVICE_LIBRARIES "asound" "gpiod")
+set(MY_DEVICE_LIBRARIES "asound" "gpiodcxx")
 
 ########################################################################
 # build the module
@@ -44,3 +44,4 @@ SOAPY_SDR_MODULE_UTIL(
 option(INSTALL_PIPEWIRE_CONF "Install PipeWire configuration to prevent it from trying to use SX1255 as a normal sound card" ON)
 if (INSTALL_PIPEWIRE_CONF)
 install(FILES 60-pipewire-do-not-use-i2s.lua DESTINATION /usr/share/wireplumber/main.lua.d/)
+endif (INSTALL_PIPEWIRE_CONF)
